@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>A3 试卷拆分为 A4 工具</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 20px;
+      background: #f9f9f9;
+      color: #333;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 10px;
+    }
+    #instructions {
+      background: #eef5ff;
+      padding: 12px 16px;
+      border-left: 4px solid #3399ff;
+      margin-bottom: 20px;
+      border-radius: 4px;
+    }
+    #canvasContainer {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      max-width: 100%;
+      overflow-x: auto;
+      border: 1px solid #ccc;
+      background: white;
+      padding: 10px;
+    }
+    .canvas-page {
+      position: relative;
+      margin-bottom: 10px;
+      border: 1px solid #aaa;
+      overflow: hidden; /* Changed from visible to hidden */
+      width: 100%;     /* Let the container manage width */
+      max-width: 1000px;/* Limit max display width */
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+      /* Removed fixed width/height, let canvas dictate aspect ratio */
+    }
+    canvas {
+      /* Canvas should dictate aspect ratio, width 100% fills container */
+      width: 100%;
+      height: auto; /* Maintain aspect ratio */
+      display: block;
+      border: 1px solid #666;
+      background: #fff;
+    }
+    .cut-line {
+      position: absolute;
+      top: 0;
+      width: 2px;
+      height: 100%; /* Cover full display height */
+      background: red;
+      cursor: ew-resize;
+      z-index: 10; /* Ensure line is clickable */
+    }
+    .canvas-page.selected {
+      outline: 3px solid #3399ff;
+    }
+    #controls {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #controls button {
+      background-color: #3399ff;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+      transition: background-color 0.2s ease;
+    }
+    #controls button:hover:not(:disabled) { /* Prevent hover effect when disabled */
+      background-color: #237ddb;
+    }
+    #controls button:disabled { /* Style for disabled button */
+        background-color: #a0cfff;
+        cursor: not-allowed;
+    }
+    input[type="file"] {
+      margin: 10px 0 20px;
+    }
+    /* Simple loading overlay */
+    #loadingOverlay {
+      position: fixed;
+      inset: 0;
+      background-color: rgba(255, 255, 255, 0.7);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 1.2em;
+      color: #333;
+      z-index: 1000; /* Ensure it's on top */
+      visibility: hidden; /* Hidden by default */
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+    #loadingOverlay.visible {
+      visibility: visible;
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <h1>📄 A3试卷拆分为A4工具</h1>
+
+  <div id="instructions">
+    <strong>操作步骤：</strong>
+    <ol>
+      <li>上传PDF或图片格式的A3试卷 (建议为横向A3)</li>
+      <li>点击页面以选中目标页</li>
+      <li>点击“添加裁切线”按钮可在页面中间添加一条可拖动的垂直裁切线。可重复添加多条。</li>
+      <li>拖动红线调整精确位置</li>
+      <li>如需修改，可点击“删除本页裁切线”重新设置（将删除本页所有裁切线）</li>
+      <li>点击“导出为PDF”按钮，生成裁切后按A4分布的新文件 (竖向A4，按原页面顺序、从左到右顺序排列，片段将完整显示并居中)</li>
+    </ol>
+    ⚠️ 上传较大的文件或图片时，渲染画面可能需要几秒，请耐心等待加载完成。
+  </div>
+
+  <input type="file" id="fileInput" accept=".pdf,image/*" />
+  <div id="canvasContainer"></div>
+  <div id="loadingOverlay">正在处理，请稍候...</div> <div id="controls">
+    <button id="addCutLine">➕ 添加裁切线</button>
+    <button id="removeCutLines">🗑️ 删除本页裁切线</button>
+    <button id="exportPDF">📄 导出为PDF (A4)</button>
+  </div>
+
+  <script src="https://unpkg.com/pdfjs-dist@2.10.377/build/pdf.min.js"></script>
+  <script src="https://unpkg.com/pdfjs-dist@2.10.377/build/pdf.worker.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <script>
+    // Set worker path for pdf.js
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@2.10.377/build/pdf.worker.min.js';
+
+    const fileInput = document.getElementById('fileInput');
+    const container = document.getElementById('canvasContainer');
+    const addCutLineBtn = document.getElementById('addCutLine');
+    const removeCutLinesBtn = document.getElementById('removeCutLines');
+    const exportBtn = document.getElementById('exportPDF');
+    const loadingOverlay = document.getElementById('loadingOverlay'); // Get overlay element
+
+    let pages = []; // Stores { wrapper, canvas, ctx, originalImage, cutLines: [{el, ratio}] }
+    let currentPageIndex = null;
+    let isDragging = false;
+    let activeLine = null; // Track the line being dragged
+
+    // --- Loading Indicator Functions ---
+    function showLoading(message = "正在处理，请稍候...") {
+        loadingOverlay.textContent = message;
+        loadingOverlay.classList.add('visible');
+        // Disable buttons while loading
+        addCutLineBtn.disabled = true;
+        removeCutLinesBtn.disabled = true;
+        exportBtn.disabled = true;
+        fileInput.disabled = true;
+    }
+
+    function hideLoading() {
+        loadingOverlay.classList.remove('visible');
+        // Re-enable buttons
+        addCutLineBtn.disabled = false;
+        removeCutLinesBtn.disabled = false;
+        exportBtn.disabled = false;
+        fileInput.disabled = false;
+    }
+    // --- End Loading Indicator Functions ---
+
+    function createCanvasPage(width, height) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'canvas-page';
+      const canvas = document.createElement('canvas');
+      // Set canvas intrinsic size
+      canvas.width = width;
+      canvas.height = height;
+      wrapper.appendChild(canvas);
+      container.appendChild(wrapper);
+
+      const pageData = {
+          wrapper,
+          canvas,
+          ctx: canvas.getContext('2d'),
+          originalImage: null, // Store the original image data/source
+          cutLines: []
+      };
+
+      wrapper.addEventListener('click', (e) => {
+        // Prevent selecting page when clicking on line
+        if (e.target.classList.contains('cut-line')) return;
+
+        pages.forEach((p, idx) => {
+          p.wrapper.classList.remove('selected');
+          if (p === pageData) currentPageIndex = idx;
+        });
+        wrapper.classList.add('selected');
+      });
+
+      return pageData;
+    }
+
+    function addCutLineToPage(page, initialRatio = 0.5) {
+      const line = document.createElement('div');
+      line.className = 'cut-line';
+
+      const cutData = { el: line, ratio: initialRatio }; // Store ratio (0 to 1)
+
+      const updateLinePosition = () => {
+          if (!line.parentNode) {
+              window.removeEventListener('resize', updateLinePosition);
+              return;
+          }
+          const wrapperRect = page.wrapper.getBoundingClientRect();
+          if (cutData && typeof cutData.ratio === 'number' && wrapperRect.width > 0) {
+            line.style.left = `${cutData.ratio * wrapperRect.width}px`;
+          }
+      };
+
+
+      line.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        activeLine = { line, page, cutData };
+        e.stopPropagation(); // Prevent page selection
+      });
+
+      page.wrapper.appendChild(line);
+      page.cutLines.push(cutData);
+
+      requestAnimationFrame(updateLinePosition); // Update position after layout
+      window.addEventListener('resize', updateLinePosition); // Basic resize handling
+    }
+
+    window.addEventListener('mousemove', (e) => {
+        if (!isDragging || !activeLine) return;
+        const { line, page, cutData } = activeLine;
+        const wrapperRect = page.wrapper.getBoundingClientRect();
+        if (wrapperRect.width <= 0) return; // Avoid division by zero
+
+        let newX_display = e.clientX - wrapperRect.left;
+        newX_display = Math.max(0, Math.min(wrapperRect.width, newX_display));
+        const newRatio = newX_display / wrapperRect.width;
+
+        cutData.ratio = newRatio;
+        line.style.left = `${newX_display}px`;
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (isDragging) {
+            isDragging = false;
+            activeLine = null;
+        }
+    });
+
+    function removeCutLinesFromPage(page) {
+      page.cutLines.forEach(cut => {
+          cut.el.remove();
+          // NOTE: Still doesn't remove the window 'resize' listener added in addCutLineToPage.
+          // Proper cleanup would involve managing these listeners more carefully.
+      });
+      page.cutLines = [];
+    }
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      container.innerHTML = ''; // Clear previous content
+      pages = [];
+      currentPageIndex = null;
+
+      if (!file) return;
+
+      showLoading('正在加载文件，请稍候...'); // Show loading indicator
+
+      try {
+          if (file.type === 'application/pdf') {
+            const fileReader = new FileReader();
+            // Wrap FileReader in a Promise for async/await
+            await new Promise((resolve, reject) => {
+                fileReader.onload = async () => {
+                    try {
+                        const loadingTask = pdfjsLib.getDocument({ data: fileReader.result });
+                        const pdf = await loadingTask.promise;
+                        const scale = 1.5; // Render scale for display
+
+                        container.innerHTML = ''; // Clear loading message
+
+                        for (let i = 0; i < pdf.numPages; i++) {
+                            showLoading(`正在加载 PDF 第 ${i + 1} / ${pdf.numPages} 页...`);
+                            const page = await pdf.getPage(i + 1);
+                            const viewport = page.getViewport({ scale });
+                            const pageData = createCanvasPage(viewport.width, viewport.height); // Canvas for display
+
+                            const renderContext = { canvasContext: pageData.ctx, viewport: viewport };
+                            await page.render(renderContext).promise;
+
+                            // Get High-Quality Image Data
+                            const highResScale = 2.0; // Higher scale for better export quality
+                            const highResViewport = page.getViewport({ scale: highResScale });
+                            const offscreenCanvas = document.createElement('canvas');
+                            offscreenCanvas.width = highResViewport.width;
+                            offscreenCanvas.height = highResViewport.height;
+                            const offscreenCtx = offscreenCanvas.getContext('2d');
+                            const highResRenderContext = { canvasContext: offscreenCtx, viewport: highResViewport };
+                            await page.render(highResRenderContext).promise;
+                            pageData.originalImage = offscreenCanvas.toDataURL('image/png'); // Store high-res PNG
+
+                            pages.push(pageData);
+                        }
+                        resolve(); // PDF processed successfully
+                    } catch (pdfError) {
+                        reject(pdfError); // Propagate PDF processing errors
+                    }
+                };
+                fileReader.onerror = reject; // Handle FileReader errors
+                fileReader.readAsArrayBuffer(file);
+            });
+
+          } else if (file.type.startsWith('image/')) {
+              // Wrap Image loading in a Promise
+              await new Promise((resolve, reject) => {
+                  const img = new Image();
+                  img.onload = () => {
+                      container.innerHTML = ''; // Clear loading message
+                      const pageData = createCanvasPage(img.naturalWidth, img.naturalHeight);
+                      pageData.ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
+                      pageData.originalImage = pageData.canvas.toDataURL('image/png'); // Use PNG
+                      pages.push(pageData);
+                      URL.revokeObjectURL(img.src);
+                      resolve(); // Image loaded successfully
+                  };
+                  img.onerror = () => {
+                      URL.revokeObjectURL(img.src);
+                      reject(new Error('无法加载图片文件。')); // Image loading error
+                  };
+                  img.src = URL.createObjectURL(file);
+              });
+          } else {
+              throw new Error('不支持的文件类型。请上传PDF或图片。');
+          }
+      } catch (error) {
+          console.error('文件加载或处理出错:', error);
+          container.innerHTML = `<p style="color: red;">文件加载或处理出错: ${error.message}</p>`;
+          alert(`文件加载或处理出错: ${error.message}`);
+      } finally {
+          hideLoading(); // Hide loading indicator regardless of success/failure
+      }
+    });
+
+    addCutLineBtn.addEventListener('click', () => {
+      if (currentPageIndex === null || !pages[currentPageIndex]) {
+        alert('请点击选中一页后再添加裁切线');
+        return;
+      }
+      const page = pages[currentPageIndex];
+      addCutLineToPage(page, 0.5);
+    });
+
+    removeCutLinesBtn.addEventListener('click', () => {
+      if (currentPageIndex === null || !pages[currentPageIndex]) {
+        alert('请先选中页面');
+        return;
+      }
+      removeCutLinesFromPage(pages[currentPageIndex]);
+    });
+
+    // --- MODIFIED Export Logic (Async/Await + Corrected Scaling) ---
+    exportBtn.addEventListener('click', async () => { // <-- Make the function async
+      if (pages.length === 0) {
+          alert('请先上传文件。');
+          return;
+      }
+
+      const pagesWithoutCuts = pages.filter(p => p.cutLines.length === 0);
+      if (pagesWithoutCuts.length > 0) {
+        const confirmProceed = confirm(`警告：有 ${pagesWithoutCuts.length} 页没有添加裁切线，这些页面将尝试缩放到单张A4页面上。是否继续？`);
+        if (!confirmProceed) return;
+      }
+
+      showLoading('🚀 正在导出PDF，请稍候...'); // Show processing indicator
+      exportBtn.disabled = true; // Disable button during export
+
+      try {
+          const a4WidthPt = 8.27 * 72;
+          const a4HeightPt = 11.69 * 72;
+          const { jsPDF } = jspdf;
+          const pdf = new jsPDF({ orientation: 'p', unit: 'pt', format: 'a4' });
+          let pdfPageCount = 0; // Track added PDF pages
+
+          // --- Use for...of loop with await for sequential processing ---
+          for (const [index, page] of pages.entries()) {
+              showLoading(`正在处理第 ${index + 1} / ${pages.length} 页...`);
+
+              // Wrap image loading/processing in a Promise
+              await new Promise((resolve, reject) => {
+                  if (!page.originalImage) {
+                      console.warn(`Page ${index + 1} missing original image data. Skipping.`);
+                      alert(`页面 ${index + 1} 缺少图像数据，将跳过此页面。`);
+                      resolve(); // Resolve to continue with the next page
+                      return;
+                  }
+
+                  const img = new Image();
+                  img.onload = () => {
+                      const sourceCanvas = document.createElement('canvas');
+                      sourceCanvas.width = img.naturalWidth;
+                      sourceCanvas.height = img.naturalHeight;
+                      const sourceCtx = sourceCanvas.getContext('2d');
+                      sourceCtx.drawImage(img, 0, 0);
+
+                      const hasCutLines = page.cutLines.length > 0;
+
+                      if (!hasCutLines) {
+                          // --- Handle pages WITHOUT cut lines ---
+                          if (sourceCanvas.width > 0 && sourceCanvas.height > 0) {
+                              if (pdfPageCount > 0) pdf.addPage('a4', 'p');
+                              pdfPageCount++;
+                              pdf.setPage(pdfPageCount);
+
+                              const imgWidth = sourceCanvas.width;
+                              const imgHeight = sourceCanvas.height;
+                              // Fit entire image within A4 bounds
+                              const scale = Math.min(a4WidthPt / imgWidth, a4HeightPt / imgHeight);
+                              const finalWidth = imgWidth * scale;
+                              const finalHeight = imgHeight * scale;
+                              const offsetX = (a4WidthPt - finalWidth) / 2;
+                              const offsetY = (a4HeightPt - finalHeight) / 2;
+
+                              pdf.addImage(sourceCanvas.toDataURL('image/jpeg', 0.9), 'JPEG', offsetX, offsetY, finalWidth, finalHeight);
+                          } else {
+                              console.warn(`Skipping page ${index + 1} (no cuts) due to zero dimensions.`);
+                          }
+                      } else {
+                          // --- Handle pages WITH cut lines ---
+                          const sortedRatios = page.cutLines.map(line => line.ratio).sort((a, b) => a - b);
+                          const uniqueSortedRatios = [...new Set(sortedRatios)];
+                          const positions = [0, ...uniqueSortedRatios, 1];
+
+                          // --- Iterate through segments sequentially (left-to-right) ---
+                          for (let i = 0; i < positions.length - 1; i++) {
+                              const startRatio = positions[i];
+                              const endRatio = positions[i + 1];
+
+                              if (typeof startRatio !== 'number' || typeof endRatio !== 'number' || startRatio < 0 || startRatio >= endRatio || endRatio > 1) {
+                                  console.warn(`Skipping invalid segment on page ${index + 1}: start=${startRatio}, end=${endRatio}`);
+                                  continue;
+                              }
+
+                              const startX = Math.round(startRatio * sourceCanvas.width);
+                              const segmentWidth = Math.max(0, Math.round((endRatio - startRatio) * sourceCanvas.width));
+                              const segmentHeight = sourceCanvas.height;
+
+                              if (segmentWidth <= 0 || segmentHeight <= 0) {
+                                  console.warn(`Skipping zero-dimension segment on page ${index + 1} [${startRatio.toFixed(3)}-${endRatio.toFixed(3)}]`);
+                                  continue;
+                              }
+
+                              const tempCanvas = document.createElement('canvas');
+                              tempCanvas.width = segmentWidth;
+                              tempCanvas.height = segmentHeight;
+                              const tempCtx = tempCanvas.getContext('2d');
+                              tempCtx.drawImage(sourceCanvas, startX, 0, segmentWidth, segmentHeight, 0, 0, segmentWidth, segmentHeight);
+
+                              if (pdfPageCount > 0) pdf.addPage('a4', 'p');
+                              pdfPageCount++;
+                              pdf.setPage(pdfPageCount);
+
+                              // ***** CORRECTED SCALING LOGIC FOR SEGMENTS *****
+                              const imgWidth = segmentWidth;
+                              const imgHeight = segmentHeight;
+
+                              if (imgWidth > 0 && imgHeight > 0) { // Ensure dimensions are valid
+                                  // Calculate scale factors for both width and height
+                                  const scaleWidth = a4WidthPt / imgWidth;
+                                  const scaleHeight = a4HeightPt / imgHeight;
+
+                                  // Use the smaller scale factor to ensure the image fits entirely
+                                  const scale = Math.min(scaleWidth, scaleHeight);
+
+                                  // Calculate the final dimensions of the image on the PDF page
+                                  const finalWidth = imgWidth * scale;
+                                  const finalHeight = imgHeight * scale;
+
+                                  // Calculate position to center the image on the A4 page
+                                  const offsetX = (a4WidthPt - finalWidth) / 2;
+                                  const offsetY = (a4HeightPt - finalHeight) / 2;
+
+                                  // Add the image using the calculated dimensions and position
+                                  pdf.addImage(tempCanvas.toDataURL('image/jpeg', 0.9), 'JPEG', offsetX, offsetY, finalWidth, finalHeight);
+                              } else {
+                                  console.warn(`Skipping segment on page ${index + 1} due to zero dimensions after calculation.`);
+                              }
+                              // ***** END OF CORRECTED SCALING LOGIC *****
+
+                          } // --- End segment loop ---
+                      }
+                      resolve(); // Page processed successfully
+                  }; // End img.onload
+
+                  img.onerror = () => {
+                      console.error(`Error loading image data for page ${index + 1} for export.`);
+                      alert(`页面 ${index + 1} 的图像数据加载失败，将跳过此页面。`);
+                      resolve(); // Resolve even on error to continue processing other pages
+                  };
+
+                  img.src = page.originalImage; // Trigger loading
+              }); // End await new Promise
+
+          } // --- End for...of loop ---
+
+          // Save the PDF only after the loop has finished
+          if (pdfPageCount > 0) {
+              pdf.save('拆分后试卷_A4.pdf'); // Changed filename slightly
+          } else {
+              alert('未能生成任何PDF页面。请检查源文件和裁切线设置。');
+          }
+
+      } catch (error) {
+          console.error("导出PDF时发生错误:", error);
+          alert(`导出PDF失败: ${error.message}`);
+      } finally {
+          hideLoading(); // Hide loading indicator
+          exportBtn.disabled = false; // Re-enable button
+      }
+
+    }); // End exportBtn listener
+
+  </script>
+</body>
+</html>
